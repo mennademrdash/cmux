@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the focused-run launcher against a fake GitHub CLI."""
 import importlib.util
+import io
 import json
 import re
 import os
@@ -287,6 +288,22 @@ class FocusedLauncherTests(unittest.TestCase):
         result = self.adopt_only(**{**self.ci_env(), "LAUNCHER_CI_RUNS": "[]"})
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("not compiling", result.stdout)
+        self.assertFalse((self.root / "dispatch.json").exists(), "must not dispatch")
+
+    def test_adopt_main_dispatches_the_head_for_test_e2e_to_adopt_mains_product(self):
+        tour = self.root / "tour.json"
+        tour.write_text(json.dumps({"steps": [{"shot": "start"}]}))
+        result = self.launch("--scenario", str(tour), "--adopt-only", "--adopt-main",
+                             **{**self.ci_env(), "LAUNCHER_CI_RUNS": "[]"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.dispatch()["require_adopted_product"], "true")
+
+    def test_adopt_main_needs_adopt_only(self):
+        tour = self.root / "tour.json"
+        tour.write_text(json.dumps({"steps": [{"shot": "start"}]}))
+        result = self.launch("--scenario", str(tour), "--adopt-main", **self.ci_env())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--adopt-main goes with --adopt-only", result.stderr)
         self.assertFalse((self.root / "dispatch.json").exists(), "must not dispatch")
 
     def test_adopt_only_exits_when_ci_ends_without_products(self):
@@ -1697,6 +1714,23 @@ class WorkflowRunnerPoolTests(unittest.TestCase):
         with mock.patch.object(self.pool.pr_runner_pool.GitHub, "runners", side_effect=RuntimeError("403")), \
                 mock.patch("sys.stderr"):
             self.assertIsNone(read("manaflow-ai/cmux", {"ROUTE_TOKEN": "t"}, "1", "/Applications/Xcode_26.6.app"))
+
+    def test_main_routes_by_the_online_runners_not_the_slot_variable(self):
+        root = self.pool.pr_runner_pool.root_label(MINI)
+        runners = [{"status": "online", "busy": False, "labels": [{"name": MINI}, {"name": root}]}]
+        argv = ["--requested", MINI, "--owned", "1", "--owned-slots", '{"std": 40}',
+                "--pr-xcode-app", "/Applications/Xcode_26.6.app"]
+        env = {"ROUTE_TOKEN": "t", "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+
+        def run(listing):
+            with mock.patch.object(self.pool.pr_runner_pool.GitHub, "runners", **listing), \
+                    mock.patch("sys.stderr"), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                self.assertEqual(self.pool.main(argv, env), 0)
+            return out.getvalue().strip()
+        # An online root runner turns root routing on without a root count in CI_OWNED_POOL_SLOTS.
+        self.assertEqual(run({"return_value": runners}), root)
+        # No listing: the variable decides, and it has no root count.
+        self.assertEqual(run({"side_effect": RuntimeError("403")}), MINI)
 
     def test_the_workflow_mints_the_routing_token_for_auto_only(self):
         steps = self.jobs[next(name for name, job in self.jobs.items()
